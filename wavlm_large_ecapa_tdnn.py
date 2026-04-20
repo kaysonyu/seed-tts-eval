@@ -11,10 +11,50 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch import Tensor
 from torch.nn import LayerNorm, Parameter
-from torch.nn.utils.rnn import pad_sequence
 
 
 logger = logging.getLogger(__name__)
+
+
+def _in_export_mode() -> bool:
+    compiler = getattr(torch, "compiler", None)
+    return torch.jit.is_tracing() or torch.jit.is_scripting() or (
+        compiler is not None and compiler.is_compiling()
+    )
+
+
+def _build_padding_mask(lengths: Tensor, max_len: int) -> Tensor:
+    return torch.arange(max_len, device=lengths.device).unsqueeze(0) >= lengths.unsqueeze(1)
+
+
+def _apply_conv_padding_mask(x: Tensor, padding_mask: Tensor) -> Tensor:
+    return x.masked_fill(padding_mask.unsqueeze(1), 0.0)
+
+
+def _apply_sequence_padding_mask(x: Tensor, padding_mask: Tensor) -> Tensor:
+    return x.masked_fill(padding_mask.unsqueeze(-1), 0.0)
+
+
+def _apply_tbc_padding_mask(x: Tensor, padding_mask: Tensor) -> Tensor:
+    return x.masked_fill(padding_mask.transpose(0, 1).unsqueeze(-1), 0.0)
+
+
+def _masked_waveform_layer_norm(x: Tensor, padding_mask: Tensor, eps: float = 1e-5) -> Tensor:
+    valid = (~padding_mask).to(dtype=x.dtype)
+    counts = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+    mean = (x * valid).sum(dim=1, keepdim=True) / counts
+    centered = (x - mean) * valid
+    var = (centered * centered).sum(dim=1, keepdim=True) / counts
+    return centered / torch.sqrt(var + eps)
+
+
+def _masked_time_stats(x: Tensor, padding_mask: Tensor) -> Tuple[Tensor, Tensor]:
+    valid = (~padding_mask).unsqueeze(1).to(dtype=x.dtype)
+    counts = valid.sum(dim=2, keepdim=True).clamp_min(1.0)
+    mean = (x * valid).sum(dim=2, keepdim=True) / counts
+    centered = (x - mean) * valid
+    var = (centered * centered).sum(dim=2, keepdim=True) / counts
+    return mean, var
 
 
 def build_wavlm_large_config() -> Dict[str, object]:
@@ -443,11 +483,12 @@ class MultiheadAttention(nn.Module):
         is_tpu = query.device.type == "xla"
         tgt_len, bsz, embed_dim = query.size()
         src_len = tgt_len
-        assert embed_dim == self.embed_dim
+        if not _in_export_mode():
+            assert embed_dim == self.embed_dim
 
         if key is not None:
             src_len, key_bsz, _ = key.size()
-            if not torch.jit.is_scripting():
+            if not _in_export_mode():
                 assert key_bsz == bsz
                 assert value is not None
                 assert src_len, bsz == value.shape[:2]
@@ -465,6 +506,7 @@ class MultiheadAttention(nn.Module):
             and incremental_state is None
             and not static_kv
             and not torch.jit.is_scripting()
+            and not (getattr(torch, "compiler", None) is not None and torch.compiler.is_compiling())
             and self.q_head_dim == self.head_dim
         ):
             assert key is not None and value is not None
@@ -593,12 +635,13 @@ class MultiheadAttention(nn.Module):
             self._set_input_buffer(incremental_state, saved_state)
 
         assert k is not None
-        assert k.size(1) == src_len
+        if not _in_export_mode():
+            assert k.size(1) == src_len
 
         if key_padding_mask is not None and key_padding_mask.dim() == 0:
             key_padding_mask = None
 
-        if key_padding_mask is not None:
+        if key_padding_mask is not None and not _in_export_mode():
             assert key_padding_mask.size(0) == bsz
             assert key_padding_mask.size(1) == src_len
 
@@ -623,7 +666,8 @@ class MultiheadAttention(nn.Module):
 
         attn_weights = torch.bmm(q, k.transpose(1, 2))
         attn_weights = self.apply_sparse_mask(attn_weights, tgt_len, src_len, bsz)
-        assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
+        if not _in_export_mode():
+            assert list(attn_weights.size()) == [bsz * self.num_heads, tgt_len, src_len]
 
         if attn_mask is not None:
             attn_weights += attn_mask.unsqueeze(0)
@@ -663,7 +707,8 @@ class MultiheadAttention(nn.Module):
         attn_probs = self.dropout_module(attn_weights_float.type_as(attn_weights))
         assert v is not None
         attn = torch.bmm(attn_probs, v)
-        assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
+        if not _in_export_mode():
+            assert list(attn.size()) == [bsz * self.num_heads, tgt_len, self.head_dim]
         attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
         attn = self.out_proj(attn)
 
@@ -969,6 +1014,19 @@ class ConvFeatureExtractionModel(nn.Module):
             x = conv(x)
         return x
 
+    def get_output_lengths(self, input_lengths: Tensor) -> Tensor:
+        output_lengths = input_lengths
+        for conv in self.conv_layers:
+            conv_layer = conv[0]
+            kernel = conv_layer.kernel_size[0]
+            stride = conv_layer.stride[0]
+            output_lengths = torch.div(
+                output_lengths - kernel,
+                stride,
+                rounding_mode="floor",
+            ) + 1
+        return output_lengths.to(dtype=torch.long)
+
 
 # Source adapted from s3prl/s3prl/upstream/wavlm/WavLM.py
 class TransformerSentenceEncoderLayer(nn.Module):
@@ -1135,15 +1193,21 @@ class TransformerEncoder(nn.Module):
 
     def extract_features(self, x, padding_mask=None, streaming_mask=None, tgt_layer=None):
         if padding_mask is not None:
-            x[padding_mask] = 0
+            x = _apply_sequence_padding_mask(x, padding_mask)
 
         x_conv = self.pos_conv(x.transpose(1, 2)).transpose(1, 2)
         x = x + x_conv
+        if padding_mask is not None:
+            x = _apply_sequence_padding_mask(x, padding_mask)
 
         if not self.layer_norm_first:
             x = self.layer_norm(x)
+            if padding_mask is not None:
+                x = _apply_sequence_padding_mask(x, padding_mask)
 
         x = F.dropout(x, p=self.dropout, training=self.training)
+        if padding_mask is not None:
+            x = _apply_sequence_padding_mask(x, padding_mask)
         x = x.transpose(0, 1)
 
         layer_results = []
@@ -1162,6 +1226,8 @@ class TransformerEncoder(nn.Module):
                     self_attn_mask=streaming_mask,
                     pos_bias=pos_bias,
                 )
+                if padding_mask is not None:
+                    x = _apply_tbc_padding_mask(x, padding_mask)
             if tgt_layer is not None:
                 layer_results.append((x, z))
             if i == tgt_layer:
@@ -1255,9 +1321,8 @@ class WavLM(nn.Module):
         return x, mask_indices
 
     def forward_padding_mask(self, features: torch.Tensor, padding_mask: torch.Tensor) -> torch.Tensor:
-        extra = padding_mask.size(1) % features.size(1)
-        if extra > 0:
-            padding_mask = padding_mask[:, :-extra]
+        trimmed_length = (padding_mask.size(1) // features.size(1)) * features.size(1)
+        padding_mask = padding_mask[:, :trimmed_length]
         padding_mask = padding_mask.view(padding_mask.size(0), features.size(1), -1)
         return padding_mask.all(-1)
 
@@ -1265,6 +1330,7 @@ class WavLM(nn.Module):
         self,
         source: torch.Tensor,
         padding_mask: Optional[torch.Tensor] = None,
+        source_lengths: Optional[torch.Tensor] = None,
         mask: bool = False,
         ret_conv: bool = False,
         output_layer: Optional[int] = None,
@@ -1279,7 +1345,10 @@ class WavLM(nn.Module):
                 features = self.feature_extractor(source)
 
         features = self.layer_norm(features.transpose(1, 2))
-        if padding_mask is not None:
+        if source_lengths is not None:
+            feature_lengths = self.feature_extractor.get_output_lengths(source_lengths)
+            padding_mask = _build_padding_mask(feature_lengths, features.size(1))
+        elif padding_mask is not None:
             padding_mask = self.forward_padding_mask(features, padding_mask)
 
         if self.post_extract_proj is not None:
@@ -1312,32 +1381,47 @@ class SingleFileWavLMUpstream(nn.Module):
         self.model = WavLM(WavLMConfig(build_wavlm_large_config()))
         self.model.feature_grad_mult = 0.0
         self.model.encoder.layerdrop = 0.0
+        self.num_hidden_states = self.model.cfg.encoder_layers + 1
 
-    def forward(self, wavs: List[Tensor]):
+    def forward(self, padded_wav: Tensor, wav_lengths: Tensor):
+        wav_padding_mask = _build_padding_mask(wav_lengths, padded_wav.size(1))
         if self.model.cfg.normalize:
-            wavs = [F.layer_norm(wav, wav.shape) for wav in wavs]
+            padded_wav = _masked_waveform_layer_norm(padded_wav, wav_padding_mask)
 
-        device = wavs[0].device
-        wav_lengths = torch.LongTensor([len(wav) for wav in wavs]).to(device)
-        wav_padding_mask = ~torch.lt(
-            torch.arange(max(wav_lengths)).unsqueeze(0).to(device),
-            wav_lengths.unsqueeze(1),
-        )
-        padded_wav = pad_sequence(wavs, batch_first=True)
         (features, layer_results), feat_padding_mask = self.model.extract_features(
-            padded_wav,
+            _apply_sequence_padding_mask(padded_wav.unsqueeze(-1), wav_padding_mask).squeeze(-1),
             padding_mask=wav_padding_mask,
+            source_lengths=wav_lengths,
             mask=False,
             output_layer=self.model.cfg.encoder_layers,
             ret_layer_results=True,
         )
-        hidden_states = [x.transpose(0, 1) for x, _ in layer_results]
+        hidden_states = torch.stack([layer_x.transpose(0, 1) for layer_x, _ in layer_results], dim=0)
+        if feat_padding_mask is not None:
+            hidden_states = hidden_states.masked_fill(feat_padding_mask.unsqueeze(0).unsqueeze(-1), 0.0)
+            features = features.masked_fill(feat_padding_mask.unsqueeze(-1), 0.0)
         return {
             "default": features,
             "hidden_states": hidden_states,
             "last_hidden_state": hidden_states[-1],
             "padding_mask": feat_padding_mask,
         }
+
+
+# Source adapted from thirdparty/UniSpeech/downstreams/speaker_verification/models/ecapa_tdnn.py
+class MaskedInstanceNorm1d(nn.Module):
+    def __init__(self, eps: float = 1e-5):
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x: Tensor, padding_mask: Tensor) -> Tensor:
+        if not _in_export_mode() and not bool(padding_mask.any().item()):
+            return F.instance_norm(x, None, None, None, None, True, 0.1, self.eps)
+
+        mean, var = _masked_time_stats(x, padding_mask)
+        valid = (~padding_mask).unsqueeze(1).to(dtype=x.dtype)
+        normalized = ((x - mean) * valid) / torch.sqrt(var + self.eps)
+        return normalized
 
 
 # Source adapted from thirdparty/UniSpeech/downstreams/speaker_verification/models/ecapa_tdnn.py
@@ -1356,17 +1440,18 @@ class Res2Conv1dReluBn(nn.Module):
         )
         self.bns = nn.ModuleList([nn.BatchNorm1d(self.width) for _ in range(self.nums)])
 
-    def forward(self, x):
+    def forward(self, x, padding_mask: Tensor):
         out = []
         spx = torch.split(x, self.width, 1)
         for i in range(self.nums):
             sp = spx[i] if i == 0 else sp + spx[i]
             sp = self.convs[i](sp)
             sp = self.bns[i](F.relu(sp))
+            sp = _apply_conv_padding_mask(sp, padding_mask)
             out.append(sp)
         if self.scale != 1:
-            out.append(spx[self.nums])
-        return torch.cat(out, dim=1)
+            out.append(_apply_conv_padding_mask(spx[self.nums], padding_mask))
+        return _apply_conv_padding_mask(torch.cat(out, dim=1), padding_mask)
 
 
 # Source adapted from thirdparty/UniSpeech/downstreams/speaker_verification/models/ecapa_tdnn.py
@@ -1376,8 +1461,9 @@ class Conv1dReluBn(nn.Module):
         self.conv = nn.Conv1d(in_channels, out_channels, kernel_size, stride, padding, dilation, bias=bias)
         self.bn = nn.BatchNorm1d(out_channels)
 
-    def forward(self, x):
-        return self.bn(F.relu(self.conv(x)))
+    def forward(self, x, padding_mask: Tensor):
+        out = self.bn(F.relu(self.conv(x)))
+        return _apply_conv_padding_mask(out, padding_mask)
 
 
 # Source adapted from thirdparty/UniSpeech/downstreams/speaker_verification/models/ecapa_tdnn.py
@@ -1387,11 +1473,14 @@ class SE_Connect(nn.Module):
         self.linear1 = nn.Linear(channels, se_bottleneck_dim)
         self.linear2 = nn.Linear(se_bottleneck_dim, channels)
 
-    def forward(self, x):
-        out = x.mean(dim=2)
+    def forward(self, x, padding_mask: Tensor):
+        if not _in_export_mode() and not bool(padding_mask.any().item()):
+            out = x.mean(dim=2)
+        else:
+            out = _masked_time_stats(x, padding_mask)[0].squeeze(2)
         out = F.relu(self.linear1(out))
         out = torch.sigmoid(self.linear2(out))
-        return x * out.unsqueeze(2)
+        return _apply_conv_padding_mask(x * out.unsqueeze(2), padding_mask)
 
 
 # Source adapted from thirdparty/UniSpeech/downstreams/speaker_verification/models/ecapa_tdnn.py
@@ -1407,13 +1496,14 @@ class SE_Res2Block(nn.Module):
         if in_channels != out_channels:
             self.shortcut = nn.Conv1d(in_channels=in_channels, out_channels=out_channels, kernel_size=1)
 
-    def forward(self, x):
+    def forward(self, x, padding_mask: Tensor):
         residual = self.shortcut(x) if self.shortcut else x
-        x = self.Conv1dReluBn1(x)
-        x = self.Res2Conv1dReluBn(x)
-        x = self.Conv1dReluBn2(x)
-        x = self.SE_Connect(x)
-        return x + residual
+        residual = _apply_conv_padding_mask(residual, padding_mask)
+        x = self.Conv1dReluBn1(x, padding_mask)
+        x = self.Res2Conv1dReluBn(x, padding_mask)
+        x = self.Conv1dReluBn2(x, padding_mask)
+        x = self.SE_Connect(x, padding_mask)
+        return _apply_conv_padding_mask(x + residual, padding_mask)
 
 
 # Source adapted from thirdparty/UniSpeech/downstreams/speaker_verification/models/ecapa_tdnn.py
@@ -1427,16 +1517,39 @@ class AttentiveStatsPool(nn.Module):
             self.linear1 = nn.Conv1d(in_dim, attention_channels, kernel_size=1)
         self.linear2 = nn.Conv1d(attention_channels, in_dim, kernel_size=1)
 
-    def forward(self, x):
+    def forward(self, x, padding_mask: Tensor):
+        if not _in_export_mode() and not bool(padding_mask.any().item()):
+            if self.global_context_att:
+                context_mean = torch.mean(x, dim=-1, keepdim=True).expand_as(x)
+                context_std = torch.sqrt(torch.var(x, dim=-1, keepdim=True) + 1e-10).expand_as(x)
+                x_in = torch.cat((x, context_mean, context_std), dim=1)
+            else:
+                x_in = x
+
+            alpha = torch.tanh(self.linear1(x_in))
+            alpha = torch.softmax(self.linear2(alpha), dim=2)
+            mean = torch.sum(alpha * x, dim=2)
+            residuals = torch.sum(alpha * (x ** 2), dim=2) - mean ** 2
+            std = torch.sqrt(residuals.clamp(min=1e-9))
+            return torch.cat([mean, std], dim=1)
+
+        x = _apply_conv_padding_mask(x, padding_mask)
         if self.global_context_att:
-            context_mean = torch.mean(x, dim=-1, keepdim=True).expand_as(x)
-            context_std = torch.sqrt(torch.var(x, dim=-1, keepdim=True) + 1e-10).expand_as(x)
+            context_mean, context_var = _masked_time_stats(x, padding_mask)
+            context_mean = context_mean.expand_as(x)
+            context_std = torch.sqrt(context_var + 1e-10).expand_as(x)
             x_in = torch.cat((x, context_mean, context_std), dim=1)
         else:
             x_in = x
 
+        x_in = _apply_conv_padding_mask(x_in, padding_mask)
         alpha = torch.tanh(self.linear1(x_in))
-        alpha = torch.softmax(self.linear2(alpha), dim=2)
+        alpha = self.linear2(alpha)
+        alpha = alpha.masked_fill(padding_mask.unsqueeze(1), torch.finfo(alpha.dtype).min)
+        alpha = torch.softmax(alpha, dim=2)
+        valid = (~padding_mask).unsqueeze(1).to(dtype=x.dtype)
+        alpha = alpha * valid
+        alpha = alpha / alpha.sum(dim=2, keepdim=True).clamp_min(1e-9)
         mean = torch.sum(alpha * x, dim=2)
         residuals = torch.sum(alpha * (x ** 2), dim=2) - mean ** 2
         std = torch.sqrt(residuals.clamp(min=1e-9))
@@ -1498,7 +1611,7 @@ class WavLMLargeECAPATDNN(nn.Module):
             input_dim=emb_dim,
             output_dim=5994,
         )
-        self.instance_norm = nn.InstanceNorm1d(feat_dim)
+        self.instance_norm = MaskedInstanceNorm1d()
         self.channels = [channels] * 4 + [1536]
         self.layer1 = Conv1dReluBn(feat_dim, self.channels[0], kernel_size=5, padding=2)
         self.layer2 = SE_Res2Block(
@@ -1541,42 +1654,57 @@ class WavLMLargeECAPATDNN(nn.Module):
         self.linear = nn.Linear(self.channels[-1] * 2, emb_dim)
 
     def get_feat_num(self):
-        self.feature_extract.eval()
-        wav = [torch.randn(self.sr).to(next(self.feature_extract.parameters()).device)]
-        with torch.no_grad():
-            features = self.feature_extract(wav)
-        select_feature = features[self.feature_selection]
-        if isinstance(select_feature, (list, tuple)):
-            return len(select_feature)
+        if self.feature_selection == "hidden_states":
+            return self.feature_extract.num_hidden_states
         return 1
 
-    def get_feat(self, x):
+    def _prepare_inputs(self, x: Tensor, lengths: Tensor) -> Tuple[Tensor, Tensor]:
+        lengths = lengths.to(device=x.device, dtype=torch.long)
+        if not _in_export_mode():
+            if x.dim() != 2:
+                raise ValueError(f"Expected x to have shape [B, T], got {tuple(x.shape)}")
+            if lengths.dim() != 1:
+                raise ValueError(f"Expected lengths to have shape [B], got {tuple(lengths.shape)}")
+            if lengths.size(0) != x.size(0):
+                raise ValueError(
+                    f"Expected lengths to have batch size {x.size(0)}, got {lengths.size(0)}"
+                )
+            if bool((lengths <= 0).any().item()):
+                raise ValueError("All lengths must be positive")
+            if bool((lengths > x.size(1)).any().item()):
+                raise ValueError("All lengths must be less than or equal to x.size(1)")
+        return x, lengths
+
+    def get_feat(self, x: Tensor, lengths: Tensor, return_padding_mask: bool = False):
+        x, lengths = self._prepare_inputs(x, lengths)
         if self.update_extract:
-            features = self.feature_extract([sample for sample in x])
+            features = self.feature_extract(x, lengths)
         else:
             with torch.no_grad():
-                features = self.feature_extract([sample for sample in x])
+                features = self.feature_extract(x, lengths)
 
+        padding_mask = features["padding_mask"]
         x = features[self.feature_selection]
-        if isinstance(x, (list, tuple)):
-            x = torch.stack(x, dim=0)
-        else:
+        if x.dim() == 3:
             x = x.unsqueeze(0)
 
         norm_weights = F.softmax(self.feature_weight, dim=-1).unsqueeze(-1).unsqueeze(-1).unsqueeze(-1)
         x = (norm_weights * x).sum(dim=0)
         x = torch.transpose(x, 1, 2) + 1e-6
-        return self.instance_norm(x)
+        x = self.instance_norm(x, padding_mask)
+        if return_padding_mask:
+            return x, padding_mask
+        return x
 
-    def forward(self, x):
-        x = self.get_feat(x)
-        out1 = self.layer1(x)
-        out2 = self.layer2(out1)
-        out3 = self.layer3(out2)
-        out4 = self.layer4(out3)
+    def forward(self, x: Tensor, lengths: Tensor):
+        x, padding_mask = self.get_feat(x, lengths, return_padding_mask=True)
+        out1 = self.layer1(x, padding_mask)
+        out2 = self.layer2(out1, padding_mask)
+        out3 = self.layer3(out2, padding_mask)
+        out4 = self.layer4(out3, padding_mask)
         out = torch.cat([out2, out3, out4], dim=1)
-        out = F.relu(self.conv(out))
-        out = self.bn(self.pooling(out))
+        out = _apply_conv_padding_mask(F.relu(self.conv(out)), padding_mask)
+        out = self.bn(self.pooling(out, padding_mask))
         return self.linear(out)
 
 

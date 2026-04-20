@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 import pytest
 import torch
+from torch.nn.utils.rnn import pad_sequence
 
 
 ROOT = Path(__file__).resolve().parent
@@ -87,6 +88,10 @@ def _build_old_and_new_models(modules, checkpoint_state):
         os.unlink(upstream_ckpt)
 
 
+def _full_lengths(x: torch.Tensor) -> torch.Tensor:
+    return torch.full((x.size(0),), x.size(1), dtype=torch.long, device=x.device)
+
+
 def _example_inputs():
     torch.manual_seed(0)
     seeded_random = torch.randn(2, 32000)
@@ -123,10 +128,11 @@ def test_get_feat_matches_old_implementation(modules, checkpoint_state, example_
     old_model, new_model = _build_old_and_new_models(modules, checkpoint_state)
     example = _example_inputs()[example_name]
     x = example["input"]
+    lengths = _full_lengths(x)
 
     with torch.no_grad():
         old_feat = old_model.get_feat(x)
-        new_feat = new_model.get_feat(x)
+        new_feat = new_model.get_feat(x, lengths)
 
     assert old_feat.shape == new_feat.shape == example["feat_shape"]
     assert torch.equal(old_feat, new_feat), (
@@ -140,13 +146,84 @@ def test_forward_matches_old_implementation(modules, checkpoint_state, example_n
     old_model, new_model = _build_old_and_new_models(modules, checkpoint_state)
     example = _example_inputs()[example_name]
     x = example["input"]
+    lengths = _full_lengths(x)
 
     with torch.no_grad():
         old_emb = old_model(x)
-        new_emb = new_model(x)
+        new_emb = new_model(x, lengths)
 
     assert old_emb.shape == new_emb.shape == example["emb_shape"]
     assert torch.equal(old_emb, new_emb), (
         f"forward mismatch for {example_name}: "
         f"max_abs_diff={(old_emb - new_emb).abs().max().item()}"
     )
+
+
+def test_padded_batch_matches_single_utterance_forward(modules, checkpoint_state):
+    _, new_module, _ = modules
+    model = new_module.WavLMLargeECAPATDNN()
+    model.load_state_dict(checkpoint_state, strict=True)
+    model.eval()
+
+    sr = 16000
+    t_long = torch.arange(0, sr * 2, dtype=torch.float32) / sr
+    t_mid = torch.arange(0, int(sr * 1.5), dtype=torch.float32) / sr
+    t_short = torch.arange(0, sr, dtype=torch.float32) / sr
+    wav_a = 0.20 * torch.sin(2 * math.pi * 220 * t_short)
+    wav_b = 0.18 * torch.sin(2 * math.pi * 330 * t_mid + 0.2)
+    wav_c = 0.15 * torch.sin(2 * math.pi * 440 * t_long + 0.5)
+    wav_c = wav_c + 0.04 * torch.cos(2 * math.pi * 120 * t_long)
+    wavs = [wav_a, wav_b, wav_c]
+
+    padded = pad_sequence(wavs, batch_first=True)
+    lengths = torch.tensor([wav.numel() for wav in wavs], dtype=torch.long)
+
+    with torch.no_grad():
+        batch_feat, batch_mask = model.get_feat(padded, lengths, return_padding_mask=True)
+        batch_emb = model(padded, lengths)
+        single_feats = []
+        single_embs = []
+        for wav in wavs:
+            x = wav.unsqueeze(0)
+            x_lengths = torch.tensor([wav.numel()], dtype=torch.long)
+            single_feats.append(model.get_feat(x, x_lengths)[0])
+            single_embs.append(model(x, x_lengths)[0])
+
+    single_emb = torch.stack(single_embs, dim=0)
+    for idx, single_feat in enumerate(single_feats):
+        valid_frames = single_feat.size(-1)
+        torch.testing.assert_close(batch_feat[idx, :, :valid_frames], single_feat, rtol=0.0, atol=1e-4)
+        assert torch.count_nonzero(batch_feat[idx, :, valid_frames:]) == 0
+        assert bool(batch_mask[idx, valid_frames:].all().item())
+    torch.testing.assert_close(batch_emb, single_emb, rtol=0.0, atol=1e-5)
+
+
+def test_trace_and_export_accept_tensor_batch_with_lengths(modules):
+    _, new_module, _ = modules
+    model = new_module.WavLMLargeECAPATDNN().eval()
+
+    x = torch.randn(2, 16000)
+    lengths = torch.tensor([16000, 12000], dtype=torch.long)
+    traced = torch.jit.trace(model, (x, lengths), strict=True)
+
+    other_x = torch.randn(3, 16000)
+    other_lengths = torch.tensor([16000, 9000, 15000], dtype=torch.long)
+    with torch.no_grad():
+        eager_out = model(other_x, other_lengths)
+        traced_out = traced(other_x, other_lengths)
+
+    torch.testing.assert_close(traced_out, eager_out, rtol=0.0, atol=1e-5)
+    exported = torch.export.export(model, (x, lengths))
+    assert exported is not None
+
+
+def test_lengths_validation_rejects_invalid_lengths(modules):
+    _, new_module, _ = modules
+    model = new_module.WavLMLargeECAPATDNN().eval()
+    x = torch.randn(2, 16000)
+
+    with pytest.raises(ValueError, match="positive"):
+        model(x, torch.tensor([16000, 0], dtype=torch.long))
+
+    with pytest.raises(ValueError, match="less than or equal"):
+        model(x, torch.tensor([16000, 16001], dtype=torch.long))
