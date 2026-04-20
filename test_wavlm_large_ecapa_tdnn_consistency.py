@@ -16,6 +16,10 @@ CHECKPOINT = Path(
 )
 OLD_MODEL_FILE = ROOT / "thirdparty/UniSpeech/downstreams/speaker_verification/models/ecapa_tdnn.py"
 NEW_MODEL_FILE = ROOT / "wavlm_large_ecapa_tdnn.py"
+GET_FEAT_ATOL = 1e-4
+EMBED_ATOL = 1e-5
+ONNX_HIDDEN_ATOL = 2e-5
+ONNX_EMBED_ATOL = 1e-4
 
 
 def _load_module_from_path(path: Path, module_name: str):
@@ -92,6 +96,53 @@ def _full_lengths(x: torch.Tensor) -> torch.Tensor:
     return torch.full((x.size(0),), x.size(1), dtype=torch.long, device=x.device)
 
 
+def _run_onnxruntime(model: torch.nn.Module, x: torch.Tensor, lengths: torch.Tensor, output_names):
+    ort = pytest.importorskip("onnxruntime")
+    with tempfile.TemporaryDirectory() as tmpdir:
+        onnx_path = Path(tmpdir) / "model.onnx"
+        torch.onnx.export(
+            model,
+            (x, lengths),
+            str(onnx_path),
+            input_names=["x", "lengths"],
+            output_names=output_names,
+            opset_version=18,
+            dynamo=True,
+        )
+        session = ort.InferenceSession(str(onnx_path), providers=["CPUExecutionProvider"])
+        outputs = session.run(
+            None,
+            {
+                "x": x.cpu().numpy(),
+                "lengths": lengths.cpu().numpy(),
+            },
+        )
+    return [torch.from_numpy(output) for output in outputs]
+
+
+def _original_relative_positions_bucket(relative_positions, num_buckets: int, max_distance: int, bidirectional: bool):
+    relative_buckets = 0
+    if bidirectional:
+        num_buckets = num_buckets // 2
+        relative_buckets += (relative_positions > 0).to(torch.long) * num_buckets
+        relative_positions = torch.abs(relative_positions)
+    else:
+        relative_positions = -torch.min(relative_positions, torch.zeros_like(relative_positions))
+
+    max_exact = num_buckets // 2
+    is_small = relative_positions < max_exact
+    relative_postion_if_large = max_exact + (
+        torch.log(relative_positions.float() / max_exact)
+        / math.log(max_distance / max_exact)
+        * (num_buckets - max_exact)
+    ).to(torch.long)
+    relative_postion_if_large = torch.min(
+        relative_postion_if_large,
+        torch.full_like(relative_postion_if_large, num_buckets - 1),
+    )
+    return relative_buckets + torch.where(is_small, relative_positions, relative_postion_if_large)
+
+
 def _example_inputs():
     torch.manual_seed(0)
     seeded_random = torch.randn(2, 32000)
@@ -135,10 +186,7 @@ def test_get_feat_matches_old_implementation(modules, checkpoint_state, example_
         new_feat = new_model.get_feat(x, lengths)
 
     assert old_feat.shape == new_feat.shape == example["feat_shape"]
-    assert torch.equal(old_feat, new_feat), (
-        f"get_feat mismatch for {example_name}: "
-        f"max_abs_diff={(old_feat - new_feat).abs().max().item()}"
-    )
+    torch.testing.assert_close(old_feat, new_feat, rtol=0.0, atol=GET_FEAT_ATOL)
 
 
 @pytest.mark.parametrize("example_name", list(_example_inputs().keys()))
@@ -153,10 +201,7 @@ def test_forward_matches_old_implementation(modules, checkpoint_state, example_n
         new_emb = new_model(x, lengths)
 
     assert old_emb.shape == new_emb.shape == example["emb_shape"]
-    assert torch.equal(old_emb, new_emb), (
-        f"forward mismatch for {example_name}: "
-        f"max_abs_diff={(old_emb - new_emb).abs().max().item()}"
-    )
+    torch.testing.assert_close(old_emb, new_emb, rtol=0.0, atol=EMBED_ATOL)
 
 
 def test_padded_batch_matches_single_utterance_forward(modules, checkpoint_state):
@@ -215,6 +260,80 @@ def test_trace_and_export_accept_tensor_batch_with_lengths(modules):
     torch.testing.assert_close(traced_out, eager_out, rtol=0.0, atol=1e-5)
     exported = torch.export.export(model, (x, lengths))
     assert exported is not None
+
+
+def test_relative_bucket_matches_original_formula(modules):
+    _, new_module, _ = modules
+    attn = new_module.MultiheadAttention(
+        embed_dim=1024,
+        num_heads=16,
+        self_attention=True,
+        has_relative_attention_bias=True,
+        num_buckets=320,
+        max_distance=800,
+        gru_rel_pos=True,
+    )
+    relative_positions = torch.arange(-1000, 1001)
+
+    safe_bucket = attn._relative_positions_bucket(relative_positions, bidirectional=True)
+    original_bucket = _original_relative_positions_bucket(
+        relative_positions,
+        num_buckets=attn.num_buckets,
+        max_distance=attn.max_distance,
+        bidirectional=True,
+    )
+
+    assert torch.equal(safe_bucket, original_bucket)
+
+
+def test_relative_attention_fast_and_export_paths_match(modules, checkpoint_state):
+    _, new_module, _ = modules
+    model = new_module.WavLMLargeECAPATDNN().eval()
+    model.load_state_dict(checkpoint_state, strict=True)
+
+    x = torch.randn(2, 16000)
+    lengths = torch.tensor([16000, 12000], dtype=torch.long)
+
+    with torch.no_grad():
+        eager_hidden = model.feature_extract(x, lengths)["hidden_states"]
+
+    with patch.object(torch.compiler, "is_compiling", return_value=True):
+        with torch.no_grad():
+            export_hidden = model.feature_extract(x, lengths)["hidden_states"]
+
+    torch.testing.assert_close(eager_hidden, export_hidden, rtol=0.0, atol=ONNX_HIDDEN_ATOL)
+
+
+def test_onnxruntime_matches_eager_hidden_states_and_embeddings(modules, checkpoint_state):
+    _, new_module, _ = modules
+    model = new_module.WavLMLargeECAPATDNN().eval()
+    model.load_state_dict(checkpoint_state, strict=True)
+
+    class HiddenStatesWrapper(torch.nn.Module):
+        def __init__(self, wrapped_model):
+            super().__init__()
+            self.wrapped_model = wrapped_model
+
+        def forward(self, x, lengths):
+            return self.wrapped_model.feature_extract(x, lengths)["hidden_states"]
+
+    x = torch.randn(2, 16000)
+    lengths = torch.tensor([16000, 12000], dtype=torch.long)
+
+    with torch.no_grad():
+        eager_hidden = model.feature_extract(x, lengths)["hidden_states"]
+        eager_emb = model(x, lengths)
+
+    onnx_hidden = _run_onnxruntime(
+        HiddenStatesWrapper(model).eval(),
+        x,
+        lengths,
+        output_names=["hidden_states"],
+    )[0]
+    onnx_emb = _run_onnxruntime(model, x, lengths, output_names=["emb"])[0]
+
+    torch.testing.assert_close(eager_hidden, onnx_hidden, rtol=0.0, atol=ONNX_HIDDEN_ATOL)
+    torch.testing.assert_close(eager_emb, onnx_emb, rtol=0.0, atol=ONNX_EMBED_ATOL)
 
 
 def test_lengths_validation_rejects_invalid_lengths(modules):

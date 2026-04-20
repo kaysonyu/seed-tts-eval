@@ -39,6 +39,18 @@ def _apply_tbc_padding_mask(x: Tensor, padding_mask: Tensor) -> Tensor:
     return x.masked_fill(padding_mask.transpose(0, 1).unsqueeze(-1), 0.0)
 
 
+def _canonical_additive_mask(mask: Optional[Tensor], target_dtype: torch.dtype) -> Optional[Tensor]:
+    if mask is None:
+        return None
+    if mask.dtype != torch.bool and not torch.is_floating_point(mask):
+        raise TypeError(f"Unsupported attention mask dtype: {mask.dtype}")
+    if not torch.is_floating_point(mask):
+        mask = torch.zeros_like(mask, dtype=target_dtype).masked_fill(mask, float("-inf"))
+    else:
+        mask = mask.to(dtype=target_dtype)
+    return mask
+
+
 def _masked_waveform_layer_norm(x: Tensor, padding_mask: Tensor, eps: float = 1e-5) -> Tensor:
     valid = (~padding_mask).to(dtype=x.dtype)
     counts = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
@@ -435,8 +447,9 @@ class MultiheadAttention(nn.Module):
 
         max_exact = num_buckets // 2
         is_small = relative_positions < max_exact
+        safe_relative_positions = torch.clamp(relative_positions, min=max_exact)
         relative_postion_if_large = max_exact + (
-            torch.log(relative_positions.float() / max_exact)
+            torch.log(safe_relative_positions.float() / float(max_exact))
             / math.log(max_distance / max_exact)
             * (num_buckets - max_exact)
         ).to(torch.long)
@@ -462,6 +475,104 @@ class MultiheadAttention(nn.Module):
         )
         values = self.relative_attention_bias(relative_position_bucket)
         return values.permute([2, 0, 1])
+
+    def _relative_attention_forward(
+        self,
+        query: Tensor,
+        key: Tensor,
+        value: Tensor,
+        key_padding_mask: Optional[Tensor],
+        attn_mask: Optional[Tensor],
+        before_softmax: bool,
+        need_weights: bool,
+        need_head_weights: bool,
+        position_bias: Tensor,
+    ) -> Tuple[Tensor, Optional[Tensor], Tensor]:
+        tgt_len, bsz, embed_dim = query.size()
+        src_len = key.size(0)
+
+        q = self.q_proj(query)
+        k = self.k_proj(key)
+        v = self.v_proj(value)
+
+        q = q.contiguous().view(tgt_len, bsz * self.num_heads, self.q_head_dim).transpose(0, 1)
+        k = k.contiguous().view(src_len, bsz * self.num_heads, self.k_head_dim).transpose(0, 1)
+        v = v.contiguous().view(src_len, bsz * self.num_heads, self.head_dim).transpose(0, 1)
+        q = q * self.scaling
+
+        merged_attn_mask = _canonical_additive_mask(attn_mask, q.dtype)
+        if merged_attn_mask is not None:
+            if merged_attn_mask.dim() == 2:
+                if merged_attn_mask.shape != (tgt_len, src_len):
+                    raise RuntimeError(
+                        f"The shape of the 2D attn_mask is {tuple(merged_attn_mask.shape)}, "
+                        f"but should be {(tgt_len, src_len)}."
+                    )
+                merged_attn_mask = merged_attn_mask.unsqueeze(0)
+            elif merged_attn_mask.dim() == 3:
+                expected_shape = (bsz * self.num_heads, tgt_len, src_len)
+                if merged_attn_mask.shape != expected_shape:
+                    raise RuntimeError(
+                        f"The shape of the 3D attn_mask is {tuple(merged_attn_mask.shape)}, "
+                        f"but should be {expected_shape}."
+                    )
+            else:
+                raise RuntimeError(f"attn_mask's dimension {merged_attn_mask.dim()} is not supported")
+
+        rel_attn_mask = position_bias
+        if self.gru_rel_pos:
+            query_layer = query.transpose(0, 1).contiguous()
+            query_layer = query_layer.view(bsz, tgt_len, self.num_heads, self.q_head_dim).permute(
+                0, 2, 1, 3
+            )
+            gate_a, gate_b = torch.sigmoid(
+                self.grep_linear(query_layer).view(bsz, self.num_heads, tgt_len, 2, 4).sum(-1)
+            ).chunk(2, dim=-1)
+            gate_a_1 = gate_a * (gate_b * self.grep_a - 1.0) + 2.0
+            rel_attn_mask = gate_a_1.view(bsz * self.num_heads, tgt_len, 1) * position_bias
+        rel_attn_mask = rel_attn_mask.view(bsz * self.num_heads, tgt_len, src_len)
+        merged_attn_mask = (
+            rel_attn_mask if merged_attn_mask is None else merged_attn_mask + rel_attn_mask
+        )
+
+        if key_padding_mask is not None:
+            key_padding_mask = _canonical_additive_mask(key_padding_mask, q.dtype)
+            key_padding_mask = (
+                key_padding_mask.view(bsz, 1, 1, src_len)
+                .expand(-1, self.num_heads, -1, -1)
+                .reshape(bsz * self.num_heads, 1, src_len)
+            )
+            merged_attn_mask = (
+                key_padding_mask if merged_attn_mask is None else merged_attn_mask + key_padding_mask
+            )
+
+        attn_weights = (
+            torch.baddbmm(merged_attn_mask, q, k.transpose(1, 2))
+            if merged_attn_mask is not None
+            else torch.bmm(q, k.transpose(1, 2))
+        )
+
+        if before_softmax:
+            return attn_weights, v, position_bias
+
+        attn_weights_float = F.softmax(attn_weights, dim=-1)
+        attn_probs = self.dropout_module(attn_weights_float.type_as(attn_weights))
+        attn = torch.bmm(attn_probs, v)
+        attn = attn.transpose(0, 1).contiguous().view(tgt_len, bsz, embed_dim)
+        attn = self.out_proj(attn)
+
+        attn_weights_out: Optional[Tensor] = None
+        if need_weights:
+            attn_weights_out = attn_weights_float.view(
+                bsz,
+                self.num_heads,
+                tgt_len,
+                src_len,
+            ).transpose(1, 0)
+            if not need_head_weights:
+                attn_weights_out = attn_weights_out.mean(dim=0)
+
+        return attn, attn_weights_out, position_bias
 
     def forward(
         self,
@@ -501,6 +612,29 @@ class MultiheadAttention(nn.Module):
                 .view(bsz * self.num_heads, tgt_len, src_len)
             )
 
+        if key_padding_mask is not None and key_padding_mask.dim() == 0:
+            key_padding_mask = None
+
+        if (
+            position_bias is not None
+            and incremental_state is None
+            and not static_kv
+            and not is_tpu
+            and self.q_head_dim == self.head_dim
+        ):
+            assert key is not None and value is not None
+            return self._relative_attention_forward(
+                query=query,
+                key=key,
+                value=value,
+                key_padding_mask=key_padding_mask,
+                attn_mask=attn_mask,
+                before_softmax=before_softmax,
+                need_weights=need_weights,
+                need_head_weights=need_head_weights,
+                position_bias=position_bias,
+            )
+
         if (
             not is_tpu
             and incremental_state is None
@@ -508,28 +642,10 @@ class MultiheadAttention(nn.Module):
             and not torch.jit.is_scripting()
             and not (getattr(torch, "compiler", None) is not None and torch.compiler.is_compiling())
             and self.q_head_dim == self.head_dim
+            and position_bias is None
         ):
             assert key is not None and value is not None
             assert attn_mask is None
-
-            attn_mask_rel_pos = None
-            if position_bias is not None:
-                attn_mask_rel_pos = position_bias
-                if self.gru_rel_pos:
-                    query_layer = query.transpose(0, 1)
-                    new_x_shape = query_layer.size()[:-1] + (self.num_heads, -1)
-                    query_layer = query_layer.view(*new_x_shape).permute(0, 2, 1, 3)
-                    _B, _H, _L, __ = query_layer.size()
-                    gate_a, gate_b = torch.sigmoid(
-                        self.grep_linear(query_layer)
-                        .view(_B, _H, _L, 2, 4)
-                        .sum(-1, keepdim=False)
-                    ).chunk(2, dim=-1)
-                    gate_a_1 = gate_a * (gate_b * self.grep_a - 1.0) + 2.0
-                    attn_mask_rel_pos = (
-                        gate_a_1.view(bsz * self.num_heads, -1, 1) * position_bias
-                    )
-                attn_mask_rel_pos = attn_mask_rel_pos.view((-1, tgt_len, tgt_len))
 
             x, attn = F.multi_head_attention_forward(
                 query,
@@ -548,7 +664,7 @@ class MultiheadAttention(nn.Module):
                 self.training,
                 key_padding_mask,
                 need_weights,
-                attn_mask_rel_pos,
+                None,
                 use_separate_proj_weight=True,
                 q_proj_weight=self.q_proj.weight,
                 k_proj_weight=self.k_proj.weight,
@@ -637,9 +753,6 @@ class MultiheadAttention(nn.Module):
         assert k is not None
         if not _in_export_mode():
             assert k.size(1) == src_len
-
-        if key_padding_mask is not None and key_padding_mask.dim() == 0:
-            key_padding_mask = None
 
         if key_padding_mask is not None and not _in_export_mode():
             assert key_padding_mask.size(0) == bsz
